@@ -1,0 +1,379 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>SaveTube</title>
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600;700&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet"/>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:#0a0a0f;font-family:'DM Sans',sans-serif}
+  ::-webkit-scrollbar{width:4px}
+  ::-webkit-scrollbar-track{background:transparent}
+  ::-webkit-scrollbar-thumb{background:#2a2a3a;border-radius:4px}
+  .quality-row:hover{background:rgba(230,57,70,0.07)!important;border-color:rgba(230,57,70,0.25)!important}
+  .saved-card:hover{background:rgba(255,255,255,0.04)!important}
+  .tab-btn:hover{color:#fff!important}
+  .del-btn:hover{color:#e63946!important}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  @keyframes fadeIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+  .animate-in{animation:fadeIn 0.3s ease both}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useRef, useCallback } = React;
+
+// ── Change this if you run the backend on a different port ──
+const API = "http://localhost:8000";
+
+function ProgressBar({ progress, color = "#e63946" }) {
+  return (
+    <div style={{ background: "rgba(255,255,255,0.08)", borderRadius: 4, height: 4, overflow: "hidden", width: "100%" }}>
+      <div style={{ height: "100%", width: `${progress}%`, background: `linear-gradient(90deg,${color},#ff6b6b)`, borderRadius: 4, transition: "width 0.4s ease", boxShadow: `0 0 8px ${color}80` }} />
+    </div>
+  );
+}
+
+function Badge({ label }) {
+  const c = { "4K": "#f59e0b", HD: "#3b82f6", "♪": "#10b981" };
+  const bg = c[label] || "#6b7280";
+  return <span style={{ fontSize: 9, fontWeight: 800, padding: "2px 5px", borderRadius: 3, background: bg+"22", color: bg, border: `1px solid ${bg}44`, letterSpacing: "0.05em", fontFamily: "monospace" }}>{label}</span>;
+}
+
+function Toast({ msg, type }) {
+  return (
+    <div style={{ position: "fixed", top: 20, left: "50%", transform: "translateX(-50%)", zIndex: 999, background: type === "error" ? "#e63946" : "#10b981", color: "#fff", padding: "10px 18px", borderRadius: 10, fontSize: 13, fontWeight: 600, boxShadow: "0 4px 20px rgba(0,0,0,0.4)", whiteSpace: "nowrap", animation: "fadeIn 0.3s ease" }}>
+      {msg}
+    </div>
+  );
+}
+
+function App() {
+  const [tab, setTab] = useState("download");
+  const [url, setUrl] = useState("");
+  const [videoData, setVideoData] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+  const [selectedQuality, setSelectedQuality] = useState(null);
+  const [jobs, setJobs] = useState([]);     // { job_id, title, thumbnail, res, size, progress, status, speed, eta, filename }
+  const [saved, setSaved] = useState([]);
+  const [toast, setToast] = useState(null);
+  const pollRef = useRef({});
+
+  // Load saved videos on mount
+  useEffect(() => { fetchSaved(); }, []);
+
+  const showToast = (msg, type = "ok") => {
+    setToast({ msg, type });
+    setTimeout(() => setToast(null), 3000);
+  };
+
+  const fetchSaved = async () => {
+    try {
+      const r = await fetch(`${API}/videos`);
+      const d = await r.json();
+      setSaved(d.videos || []);
+    } catch {
+      // backend not running yet — silently ignore
+    }
+  };
+
+  // Poll active jobs
+  useEffect(() => {
+    const id = setInterval(async () => {
+      const active = jobs.filter(j => j.status === "queued" || j.status === "downloading" || j.status === "processing");
+      for (const job of active) {
+        try {
+          const r = await fetch(`${API}/progress/${job.job_id}`);
+          const d = await r.json();
+          setJobs(prev => prev.map(j => j.job_id === job.job_id ? { ...j, ...d } : j));
+          if (d.status === "done") {
+            showToast(`✓ "${job.title.slice(0, 30)}…" saved!`);
+            fetchSaved();
+          }
+          if (d.status === "error") {
+            showToast(`Download failed: ${d.error?.slice(0, 50)}`, "error");
+          }
+        } catch {}
+      }
+    }, 1000);
+    return () => clearInterval(id);
+  }, [jobs]);
+
+  const handleFetch = async () => {
+    if (!url.trim()) return;
+    setError(""); setLoading(true); setVideoData(null); setSelectedQuality(null);
+    try {
+      const r = await fetch(`${API}/info?url=${encodeURIComponent(url)}`);
+      if (!r.ok) {
+        const e = await r.json();
+        throw new Error(e.detail || "Failed to fetch video info");
+      }
+      const d = await r.json();
+      setVideoData(d);
+    } catch (e) {
+      setError(e.message || "Could not reach the backend. Is it running?");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleDownload = async () => {
+    if (!videoData || selectedQuality === null) return;
+    const q = videoData.qualities[selectedQuality];
+    try {
+      const r = await fetch(`${API}/download`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url, format_id: q.format_id, is_audio: q.is_audio }),
+      });
+      if (!r.ok) throw new Error("Failed to start download");
+      const { job_id } = await r.json();
+      setJobs(prev => [{
+        job_id,
+        title: videoData.title,
+        thumbnail: videoData.thumbnail,
+        res: q.res,
+        size: q.size,
+        progress: 0,
+        status: "queued",
+        speed: "",
+        eta: "",
+      }, ...prev]);
+      setTab("queue");
+      setUrl(""); setVideoData(null); setSelectedQuality(null);
+    } catch (e) {
+      showToast(e.message, "error");
+    }
+  };
+
+  const handleDelete = async (filename) => {
+    try {
+      await fetch(`${API}/videos/${encodeURIComponent(filename)}`, { method: "DELETE" });
+      setSaved(prev => prev.filter(v => v.filename !== filename));
+    } catch {
+      showToast("Delete failed", "error");
+    }
+  };
+
+  const activeCount = jobs.filter(j => j.status === "queued" || j.status === "downloading" || j.status === "processing").length;
+
+  const S = {
+    wrap: { minHeight: "100vh", background: "#0a0a0f", display: "flex", justifyContent: "center" },
+    phone: { width: "100%", maxWidth: 420, minHeight: "100vh", background: "#0d0d14", display: "flex", flexDirection: "column" },
+    header: { padding: "20px 20px 0", background: "linear-gradient(180deg,#13131e 0%,transparent 100%)" },
+    tabBar: { display: "flex", background: "rgba(255,255,255,0.04)", borderRadius: 10, padding: 3, gap: 2 },
+    content: { flex: 1, overflowY: "auto", padding: "16px 20px 110px" },
+    inputRow: { background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.07)", borderRadius: 14, padding: "4px 4px 4px 16px", display: "flex", alignItems: "center", gap: 8, marginBottom: 16 },
+    input: { flex: 1, background: "transparent", border: "none", outline: "none", color: "#e8e8f0", fontSize: 14, fontFamily: "'DM Sans',sans-serif", caretColor: "#e63946" },
+    fetchBtn: (on) => ({ background: on ? "linear-gradient(135deg,#e63946,#c1121f)" : "rgba(255,255,255,0.06)", border: "none", borderRadius: 10, color: on ? "#fff" : "#444460", padding: "10px 16px", fontSize: 13, fontWeight: 600, cursor: on ? "pointer" : "not-allowed", fontFamily: "'DM Sans',sans-serif", boxShadow: on ? "0 2px 12px rgba(230,57,70,0.3)" : "none" }),
+    dlBtn: (on) => ({ width: "100%", padding: 15, background: on ? "linear-gradient(135deg,#e63946,#c1121f)" : "rgba(255,255,255,0.05)", border: "none", borderRadius: 12, color: on ? "#fff" : "#333355", fontSize: 15, fontWeight: 700, cursor: on ? "pointer" : "not-allowed", boxShadow: on ? "0 4px 20px rgba(230,57,70,0.35)" : "none", fontFamily: "'DM Sans',sans-serif" }),
+    nav: { position: "fixed", bottom: 0, width: "100%", maxWidth: 420, background: "rgba(10,10,18,0.95)", backdropFilter: "blur(20px)", borderTop: "1px solid rgba(255,255,255,0.06)", padding: "12px 20px 20px", display: "flex", justifyContent: "space-around", zIndex: 100 },
+  };
+
+  const statusColor = (s) => s === "done" ? "#10b981" : s === "error" ? "#e63946" : "#f59e0b";
+  const statusLabel = (j) => {
+    if (j.status === "done") return "✓ Saved";
+    if (j.status === "error") return "✗ Error";
+    if (j.status === "processing") return "⚙ Processing…";
+    if (j.status === "queued") return "Queued…";
+    return `${Math.round(j.progress)}% ${j.speed ? `· ${j.speed}` : ""} ${j.eta ? `· ETA ${j.eta}` : ""}`;
+  };
+
+  return (
+    <div style={S.wrap}>
+      {toast && <Toast msg={toast.msg} type={toast.type} />}
+      <div style={S.phone}>
+
+        {/* Header */}
+        <div style={S.header}>
+          <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 20 }}>
+            <div style={{ width: 36, height: 36, borderRadius: 10, background: "linear-gradient(135deg,#e63946,#c1121f)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18, boxShadow: "0 4px 16px rgba(230,57,70,0.4)" }}>▶</div>
+            <div>
+              <div style={{ fontSize: 16, fontWeight: 700, color: "#fff", letterSpacing: "-0.02em" }}>SaveTube</div>
+              <div style={{ fontSize: 10, color: "#4a4a6a", fontFamily: "'DM Mono',monospace", letterSpacing: "0.08em" }}>OFFLINE VIDEO MANAGER</div>
+            </div>
+          </div>
+          <div style={S.tabBar}>
+            {[
+              { key: "download", label: "Download" },
+              { key: "queue",    label: activeCount > 0 ? `Queue (${activeCount})` : "Queue" },
+              { key: "saved",    label: `Saved (${saved.length})` },
+            ].map(t => (
+              <button key={t.key} className="tab-btn" onClick={() => setTab(t.key)} style={{ flex: 1, padding: "8px 4px", background: tab===t.key ? "rgba(230,57,70,0.15)" : "transparent", border: tab===t.key ? "1px solid rgba(230,57,70,0.3)" : "1px solid transparent", borderRadius: 8, color: tab===t.key ? "#e63946" : "#555570", fontSize: 12, fontWeight: 600, cursor: "pointer", fontFamily: "'DM Sans',sans-serif" }}>
+                {t.label}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div style={S.content}>
+
+          {/* ── DOWNLOAD ── */}
+          {tab === "download" && (
+            <div className="animate-in">
+              <div style={S.inputRow}>
+                <span style={{ fontSize: 16, opacity: 0.4 }}>🔗</span>
+                <input value={url} onChange={e => { setUrl(e.target.value); setError(""); }} onKeyDown={e => e.key==="Enter" && handleFetch()} placeholder="Paste YouTube URL…" style={S.input} />
+                {url && <button onClick={() => { setUrl(""); setVideoData(null); setError(""); }} style={{ background: "none", border: "none", color: "#555570", cursor: "pointer", fontSize: 18, padding: "0 4px" }}>×</button>}
+                <button onClick={handleFetch} disabled={!url.trim() || loading} style={S.fetchBtn(url.trim() && !loading)}>
+                  {loading ? <span style={{ display: "inline-block", animation: "spin 0.8s linear infinite" }}>⟳</span> : "Fetch"}
+                </button>
+              </div>
+
+              {error && (
+                <div style={{ background: "rgba(230,57,70,0.08)", border: "1px solid rgba(230,57,70,0.2)", borderRadius: 10, padding: "10px 14px", marginBottom: 14, color: "#e63946", fontSize: 13 }}>
+                  ⚠ {error}
+                </div>
+              )}
+
+              {!videoData && !loading && !error && (
+                <div style={{ textAlign: "center", padding: "40px 16px" }}>
+                  <div style={{ fontSize: 48, marginBottom: 12, opacity: 0.15 }}>▶</div>
+                  <div style={{ fontSize: 13, color: "#3a3a55", lineHeight: 1.7 }}>
+                    Paste a YouTube URL and hit <strong style={{ color: "#555570" }}>Fetch</strong><br/>
+                    Make sure the backend is running first
+                  </div>
+                  <div style={{ marginTop: 14, padding: "10px 14px", background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 10, fontFamily: "'DM Mono',monospace", fontSize: 11, color: "#4a4a6a", textAlign: "left" }}>
+                    $ pip install -r requirements.txt<br/>
+                    $ uvicorn main:app --reload
+                  </div>
+                </div>
+              )}
+
+              {loading && (
+                <div style={{ textAlign: "center", padding: "40px 0", color: "#3a3a55" }}>
+                  <div style={{ fontSize: 32, animation: "spin 1s linear infinite", display: "inline-block", marginBottom: 12 }}>⟳</div>
+                  <div style={{ fontSize: 13 }}>Fetching video info…</div>
+                </div>
+              )}
+
+              {videoData && !loading && (
+                <div className="animate-in">
+                  <div style={{ background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.07)", borderRadius: 14, overflow: "hidden", marginBottom: 16 }}>
+                    <div style={{ position: "relative" }}>
+                      <img src={videoData.thumbnail} alt="" style={{ width: "100%", height: 190, objectFit: "cover", display: "block" }} />
+                      <div style={{ position: "absolute", inset: 0, background: "linear-gradient(to top,#0d0d14 0%,transparent 50%)" }} />
+                      <div style={{ position: "absolute", bottom: 10, right: 10, background: "rgba(0,0,0,0.75)", color: "#fff", padding: "3px 8px", borderRadius: 5, fontSize: 12, fontFamily: "'DM Mono',monospace" }}>{videoData.duration}</div>
+                    </div>
+                    <div style={{ padding: "12px 14px" }}>
+                      <div style={{ fontSize: 14, fontWeight: 600, color: "#e8e8f0", lineHeight: 1.4, marginBottom: 4 }}>{videoData.title}</div>
+                      <div style={{ fontSize: 12, color: "#555570" }}>{videoData.channel}{videoData.views ? ` · ${videoData.views}` : ""}</div>
+                    </div>
+                  </div>
+
+                  <div style={{ marginBottom: 16 }}>
+                    <div style={{ fontSize: 11, color: "#4a4a6a", fontWeight: 600, letterSpacing: "0.1em", marginBottom: 10 }}>SELECT QUALITY</div>
+                    <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                      {videoData.qualities.map((q, i) => (
+                        <button key={i} className="quality-row" onClick={() => setSelectedQuality(i)} style={{ display: "flex", alignItems: "center", gap: 12, padding: "12px 14px", background: selectedQuality===i ? "rgba(230,57,70,0.1)" : "rgba(255,255,255,0.03)", border: selectedQuality===i ? "1px solid rgba(230,57,70,0.35)" : "1px solid rgba(255,255,255,0.06)", borderRadius: 10, cursor: "pointer", textAlign: "left", fontFamily: "'DM Sans',sans-serif", transition: "all 0.15s" }}>
+                          <div style={{ width: 16, height: 16, borderRadius: "50%", border: selectedQuality===i ? "2px solid #e63946" : "2px solid #2a2a3a", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+                            {selectedQuality===i && <div style={{ width: 7, height: 7, borderRadius: "50%", background: "#e63946" }} />}
+                          </div>
+                          <div style={{ flex: 1 }}>
+                            <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 2 }}>
+                              <span style={{ fontSize: 13, fontWeight: 600, color: selectedQuality===i ? "#e8e8f0" : "#aaaacc" }}>{q.label}</span>
+                              {q.badge && <Badge label={q.badge} />}
+                            </div>
+                            <div style={{ fontSize: 11, color: "#4a4a6a", fontFamily: "'DM Mono',monospace" }}>{q.res}{q.fps ? ` · ${q.fps}` : ""}</div>
+                          </div>
+                          <div style={{ fontSize: 12, color: "#4a4a6a", fontFamily: "'DM Mono',monospace" }}>{q.size}</div>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <button onClick={handleDownload} disabled={selectedQuality===null} style={S.dlBtn(selectedQuality!==null)}>
+                    {selectedQuality !== null ? `↓ Download ${videoData.qualities[selectedQuality].res}` : "Select a quality to download"}
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* ── QUEUE ── */}
+          {tab === "queue" && (
+            <div className="animate-in">
+              {jobs.length === 0
+                ? <div style={{ textAlign: "center", padding: "60px 0", color: "#2d2d45" }}><div style={{ fontSize: 36, marginBottom: 12, opacity: 0.3 }}>⬦</div><div style={{ fontSize: 13, color: "#3a3a55" }}>No downloads yet</div></div>
+                : <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                    {jobs.map(d => (
+                      <div key={d.job_id} style={{ background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 12, overflow: "hidden", animation: "fadeIn 0.3s ease both" }}>
+                        <div style={{ display: "flex", gap: 12, padding: "12px 14px" }}>
+                          <img src={d.thumbnail} alt="" style={{ width: 70, height: 45, objectFit: "cover", borderRadius: 6, flexShrink: 0 }} />
+                          <div style={{ flex: 1, minWidth: 0 }}>
+                            <div style={{ fontSize: 13, fontWeight: 600, color: "#ccccdd", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", marginBottom: 3 }}>{d.title}</div>
+                            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                              <span style={{ fontSize: 11, color: "#4a4a6a", fontFamily: "'DM Mono',monospace" }}>{d.res} · {d.size}</span>
+                              <span style={{ fontSize: 11, color: statusColor(d.status), fontFamily: "'DM Mono',monospace", fontWeight: 600 }}>{statusLabel(d)}</span>
+                            </div>
+                          </div>
+                        </div>
+                        <div style={{ padding: "0 14px 12px" }}>
+                          <ProgressBar progress={d.progress} color={statusColor(d.status)} />
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+              }
+            </div>
+          )}
+
+          {/* ── SAVED ── */}
+          {tab === "saved" && (
+            <div className="animate-in">
+              {saved.length === 0
+                ? <div style={{ textAlign: "center", padding: "60px 0" }}><div style={{ fontSize: 36, marginBottom: 12, opacity: 0.15, color: "#fff" }}>⊟</div><div style={{ fontSize: 13, color: "#3a3a55" }}>No saved videos yet</div></div>
+                : <>
+                    <div style={{ fontSize: 11, color: "#4a4a6a", fontWeight: 600, letterSpacing: "0.1em", marginBottom: 12 }}>{saved.length} FILE{saved.length!==1?"S":""} · LOCAL STORAGE</div>
+                    <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                      {saved.map(v => (
+                        <div key={v.filename} className="saved-card" style={{ background: "rgba(255,255,255,0.025)", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 12, padding: "12px 14px", display: "flex", gap: 12, cursor: "pointer", transition: "background 0.15s", animation: "fadeIn 0.3s ease both" }}>
+                          <div style={{ width: 44, height: 44, borderRadius: 8, background: "rgba(230,57,70,0.1)", border: "1px solid rgba(230,57,70,0.2)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 20, flexShrink: 0 }}>
+                            {v.filename.endsWith(".mp3") || v.filename.endsWith(".m4a") ? "♪" : "▶"}
+                          </div>
+                          <div style={{ flex: 1, minWidth: 0 }}>
+                            <div style={{ fontSize: 13, fontWeight: 600, color: "#ccccdd", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", marginBottom: 4 }}>{v.filename}</div>
+                            <div style={{ fontSize: 11, color: "#4a4a6a", fontFamily: "'DM Mono',monospace" }}>{v.size}</div>
+                          </div>
+                          <div style={{ display: "flex", flexDirection: "column", gap: 6, alignItems: "flex-end" }}>
+                            <a href={`${API}${v.url}`} download style={{ background: "rgba(230,57,70,0.1)", border: "1px solid rgba(230,57,70,0.2)", borderRadius: 6, color: "#e63946", padding: "4px 10px", fontSize: 11, fontWeight: 600, textDecoration: "none" }}>↓</a>
+                            <button className="del-btn" onClick={() => handleDelete(v.filename)} style={{ background: "none", border: "none", color: "#2d2d45", cursor: "pointer", fontSize: 16, lineHeight: 1, transition: "color 0.15s" }}>×</button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </>
+              }
+            </div>
+          )}
+        </div>
+
+        {/* Bottom Nav */}
+        <div style={S.nav}>
+          {[
+            { key: "download", icon: "↓", label: "Download" },
+            { key: "queue",    icon: "≡", label: "Queue",   badge: activeCount },
+            { key: "saved",    icon: "▤", label: "Library" },
+          ].map(n => (
+            <button key={n.key} onClick={() => setTab(n.key)} style={{ background: "none", border: "none", cursor: "pointer", display: "flex", flexDirection: "column", alignItems: "center", gap: 4, color: tab===n.key ? "#e63946" : "#33334a", transition: "color 0.2s", fontFamily: "'DM Sans',sans-serif", position: "relative" }}>
+              <div style={{ fontSize: 20, lineHeight: 1 }}>{n.icon}</div>
+              <div style={{ fontSize: 10, fontWeight: 600, letterSpacing: "0.05em" }}>{n.label}</div>
+              {n.badge > 0 && <div style={{ position: "absolute", top: -4, right: -8, background: "#e63946", color: "#fff", width: 16, height: 16, borderRadius: "50%", fontSize: 9, fontWeight: 800, display: "flex", alignItems: "center", justifyContent: "center" }}>{n.badge}</div>}
+            </button>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script>
+</body>
+</html>
