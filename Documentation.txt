@@ -1,0 +1,337 @@
+================================================================================
+                        SAVETUBE — TECHNICAL DOCUMENTATION
+                  FastAPI Backend · React Frontend · yt-dlp Integration
+================================================================================
+
+
+--------------------------------------------------------------------------------
+1. PROJECT OVERVIEW
+--------------------------------------------------------------------------------
+
+SaveTube is a self-hosted YouTube video downloader made up of two parts: a
+Python backend powered by FastAPI and yt-dlp, and a single-file React frontend.
+Together they form a mobile-friendly web app that lets users fetch video
+metadata, choose a quality, download videos or audio in the background, and
+manage a local library of saved files.
+
+Key Features:
+  - Fetch video info (title, channel, duration, thumbnail, quality list)
+    without downloading anything
+  - Background download jobs with real-time progress polling
+  - Automatic video + audio merging into MP4 via FFmpeg
+  - Audio-only extraction to MP3 at 320 kbps
+  - Age-restricted video support via browser cookies or a cookies.txt file
+  - Local library view with delete and direct download links
+  - Mobile-first UI with tab navigation and toast notifications
+
+Technology Stack:
+  Layer           Technology                     Purpose
+  --------------- ------------------------------ ------------------------------
+  Backend         Python 3.10+, FastAPI          REST API, file serving, jobs
+  Downloader      yt-dlp                         Video extraction & formats
+  Media merge     FFmpeg (via yt-dlp)            Mux video + audio into MP4
+  Frontend        React 18 (UMD / Babel)         Single-file SPA, no build step
+  Fonts           DM Sans, DM Mono (Google)      UI typography
+
+
+--------------------------------------------------------------------------------
+2. PROJECT STRUCTURE
+--------------------------------------------------------------------------------
+
+  savetube/
+  ├── main.py          ← FastAPI backend
+  ├── index.html       ← React frontend (single file, no build needed)
+  ├── requirements.txt ← Python dependencies
+  ├── cookies.txt      ← (optional) Netscape-format cookie export
+  └── downloads/       ← auto-created; stores all downloaded files
+
+
+--------------------------------------------------------------------------------
+3. BACKEND — main.py
+--------------------------------------------------------------------------------
+
+The backend is a FastAPI application that exposes six REST endpoints, manages
+background download threads, and serves completed files as static assets.
+
+
+3.1 Configuration
+-----------------
+
+Downloads Directory
+  DOWNLOADS_DIR is set to a folder called "downloads/" relative to main.py.
+  It is created automatically on startup if it does not already exist.
+
+Cookie Settings
+  To access age-restricted or member-only videos, SaveTube can pass browser
+  cookies to yt-dlp in two ways:
+
+  Option A — live browser cookies:
+    Set COOKIE_BROWSER to the name of the browser you use ("chrome",
+    "firefox", "edge", "brave", "opera"). yt-dlp reads cookies directly
+    from the browser profile. The server must run on the same machine as
+    the browser.
+
+  Option B — cookies.txt file:
+    Export cookies in Netscape format and place the file next to main.py.
+    The path is read from COOKIE_FILE. If the file exists it takes priority
+    over Option A. Recommended for headless / server deployments.
+
+In-Memory Job Store
+  "jobs" is a plain Python dictionary keyed by UUID strings. Each value is
+  a dict with the fields: status, progress, filename, speed, eta, and error.
+  Job data is lost when the server restarts.
+
+
+3.2 Helper Functions
+--------------------
+
+  _cookie_opts()
+    Returns the appropriate yt-dlp cookie option dict — either "cookiefile"
+    or "cookiesfrombrowser" — depending on which is configured.
+
+  _format_seconds(secs)
+    Converts a float number of seconds into a human-readable duration string
+    (e.g. "3:45" or "1:02:30").
+
+  _human_size(b)
+    Converts a byte count into a readable string with the appropriate unit
+    (B, KB, MB, GB, TB).
+
+  _quality_label(fmt)
+    Derives a display label from a yt-dlp format dict. Returns strings like
+    "1080p 60fps", "720p", or "Audio Only — 128kbps".
+
+
+3.3 API Endpoints
+-----------------
+
+GET /
+  Health check. Returns a JSON object confirming the API is running.
+  Response: { "message": "SaveTube API is running ✔" }
+
+GET /info?url={youtube_url}
+  Fetches video metadata and available quality options without downloading.
+  Calls yt-dlp with skip_download=True, deduplicates formats by resolution
+  (keeping the highest filesize estimate per height), and returns:
+
+    title       — Video title string
+    channel     — Uploader or channel name
+    duration    — Formatted duration string
+    views       — Formatted view count string
+    thumbnail   — URL of the best available thumbnail
+    qualities   — Array of quality option objects (see below)
+
+  Each quality object contains:
+    format_id   — yt-dlp internal format ID used when starting a download
+    label       — Human-readable quality label
+    res         — Short resolution string (e.g. "1080p" or "MP3 320kbps")
+    fps         — Frame rate string if above 30fps, otherwise null
+    size        — Estimated file size or "~" if unknown
+    badge       — Display badge: "4K", "HD", "♪", or null
+    is_audio    — Boolean; true for audio-only formats
+
+  Note: Formats below 360p are filtered out. Each resolution is
+  deduplicated — only the entry with the largest filesize estimate is kept.
+
+POST /download
+  Starts a background download job. Request body (JSON):
+    url         — The YouTube video URL
+    format_id   — The yt-dlp format ID selected by the user
+    is_audio    — Boolean; if true, extracts MP3 at 320 kbps
+
+  The endpoint generates a UUID job ID, adds it to the job store with
+  status "queued", spawns a daemon thread, and immediately returns:
+    { "job_id": "uuid-string" }
+
+  For video formats, the yt-dlp format string is constructed as:
+    {format_id}+bestaudio/best[height<={format_id}]/{format_id}
+  This merges the selected video stream with the best audio and outputs MP4.
+
+GET /progress/{job_id}
+  Returns the current state of a download job. The frontend polls this
+  every second. Possible status values:
+
+    queued       — Job accepted; thread has not started yet
+    downloading  — Actively downloading; progress, speed, eta are populated
+    processing   — Download done; FFmpeg post-processing in progress
+    done         — Complete; "filename" contains the saved file's base name
+    error        — Failed; "error" contains the exception message
+
+GET /videos
+  Lists all media files in the downloads folder, sorted by modification time
+  (newest first). Only .mp4, .mkv, .webm, .mp3, and .m4a files are included.
+  Each entry has: filename, size (human-readable), url (/files/... path).
+
+DELETE /videos/{filename}
+  Deletes a file from the downloads folder. The filename is sanitised with
+  Path(filename).name to prevent path-traversal attacks. Returns HTTP 404
+  if the file does not exist.
+
+
+3.4 Background Download Thread — _run_download
+-----------------------------------------------
+
+Each download job runs in a separate daemon thread. The function accepts the
+job ID, URL, format ID, and is_audio flag. It defines an inner progress_hook
+callback that yt-dlp calls during download. The hook reads downloaded_bytes
+and total_bytes to compute a percentage and updates the job store in-place.
+
+After the download, the function resolves the final filename by checking for
+common extensions (.mp4, .mkv, .webm, .mp3, .m4a) in the downloads directory,
+since yt-dlp may change the extension during merging or post-processing.
+
+
+--------------------------------------------------------------------------------
+4. FRONTEND — index.html
+--------------------------------------------------------------------------------
+
+The entire frontend is a single HTML file. It loads React 18 and ReactDOM from
+a CDN as UMD bundles, uses Babel Standalone to transpile JSX in the browser at
+runtime, and renders into a root div. No build step is required.
+
+
+4.1 Global Configuration
+------------------------
+
+  const API = "http://localhost:8000"
+
+This is the only value you need to change if the backend runs on a different
+host or port.
+
+
+4.2 Components
+--------------
+
+ProgressBar
+  Props: progress (0–100), color (hex string, default "#e63946")
+  Renders a thin horizontal bar that fills left to right with a gradient and
+  a soft glow. Width animates with a 0.4-second ease transition.
+
+Badge
+  Props: label ("4K" | "HD" | "♪" | string)
+  A small inline tag shown next to quality labels. Amber for 4K, blue for HD,
+  green for audio, grey for unknown labels.
+
+Toast
+  Props: msg (string), type ("ok" | "error")
+  A fixed-position banner centred at the top of the screen. Green for
+  success, red for errors. Auto-dismissed after three seconds.
+
+App (main component)
+  Holds all application state and renders one of three tab views.
+
+
+4.3 State Variables
+-------------------
+
+  tab              — Active tab: "download", "queue", or "saved"
+  url              — Current value of the URL input field
+  videoData        — Null or the object returned by GET /info
+  loading          — True while a /info request is in flight
+  error            — Error message string or empty string
+  selectedQuality  — Index into videoData.qualities, or null
+  jobs             — Array of job objects (keyed by job_id)
+  saved            — Array of file objects from GET /videos
+  toast            — Null or { msg, type } driving the Toast component
+
+
+4.4 Effects & Polling
+---------------------
+
+  Mount effect:
+    Calls fetchSaved() once on mount to pre-populate the library tab.
+
+  Polling interval (every 1000 ms):
+    For each job with status "queued", "downloading", or "processing",
+    fetches GET /progress/{job_id} and merges the response into the jobs
+    array. On "done" it shows a success toast and refreshes the saved list.
+    On "error" it shows an error toast.
+
+
+4.5 Tab Views
+-------------
+
+Download Tab
+  Contains the URL input and Fetch button. On a successful fetch, shows a
+  video card (thumbnail, title, channel, duration) and a scrollable list of
+  quality buttons. Each button shows a radio indicator, label, optional badge,
+  resolution/bitrate, and estimated file size. The Download button is enabled
+  only when a quality is selected; clicking it posts to /download and switches
+  to the Queue tab.
+
+Queue Tab
+  Lists all jobs in reverse-insertion order. Each card shows the thumbnail,
+  title, resolution, file size, a live status string (with speed and ETA),
+  and a ProgressBar. The tab label shows the count of active jobs.
+
+Saved Tab (Library)
+  Lists all files from GET /videos. Each entry has a file-type icon, filename,
+  file size, a browser download link, and a delete button that calls
+  DELETE /videos/{filename} and removes the entry from local state immediately.
+
+
+--------------------------------------------------------------------------------
+5. SETUP & INSTALLATION
+--------------------------------------------------------------------------------
+
+5.1 Prerequisites
+  - Python 3.10 or later
+  - FFmpeg installed and available on the system PATH
+  - A modern web browser (Chrome, Firefox, Edge, etc.)
+
+5.2 Backend Setup
+  Install dependencies:
+    pip install fastapi uvicorn yt-dlp
+
+  Start the server:
+    uvicorn main:app --reload --port 8000
+
+  The API will be at http://localhost:8000
+  Interactive Swagger docs are available at http://localhost:8000/docs
+
+5.3 Frontend Setup
+  Open index.html directly in a browser (file:// works because CORS is open).
+  No build step or npm install is needed. To serve it over HTTP instead:
+    python -m http.server 3000
+
+5.4 Cookie Setup for Age-Restricted Videos
+  Option A — Browser cookies:
+    Set COOKIE_BROWSER in main.py to your browser (e.g. "chrome"). The
+    backend must run on the same machine as the browser you use for YouTube.
+
+  Option B — cookies.txt:
+    Install the "Get cookies.txt LOCALLY" browser extension, export cookies
+    from youtube.com, and save the file as "cookies.txt" next to main.py.
+    The backend will detect and use it automatically.
+
+
+--------------------------------------------------------------------------------
+6. LIMITATIONS & CONSIDERATIONS
+--------------------------------------------------------------------------------
+
+  - Job state is in-memory only. Restarting the server clears all job records.
+  - There is no authentication on the API. Do not expose the backend to the
+    public internet without adding a security layer.
+  - Cookies may expire; refresh them periodically for age-restricted content.
+  - The format merge string may fall back to a single-stream download if the
+    exact format ID is unavailable for a given video.
+  - FFmpeg must be on the PATH for merging and MP3 extraction to work.
+  - Babel Standalone adds ~30 KB of parse time at runtime. For production,
+    pre-build the React code with a bundler such as Vite.
+
+
+--------------------------------------------------------------------------------
+7. API QUICK REFERENCE
+--------------------------------------------------------------------------------
+
+  Method   Path                    Description
+  -------- ----------------------- --------------------------------------------
+  GET      /                       Health check
+  GET      /info?url=              Fetch video metadata & quality list
+  POST     /download               Start a background download job
+  GET      /progress/{job_id}      Poll job progress
+  GET      /videos                 List saved files
+  DELETE   /videos/{filename}      Delete a saved file
+  GET      /files/{filename}       Stream / download a saved file (static mount)
+
+================================================================================
